@@ -19,6 +19,8 @@
  * explicit DESTROY, so the local `h` would dangle.  Used only where magic
  * can actually intervene between EXTRACT and the first use of h. */
 #define REEXTRACT(sv) \
+    if (!SvROK(sv)) \
+        croak("Data::HyperLogLog::Shared object was replaced during the call"); \
     h = INT2PTR(HllHandle*, SvIV(SvRV(sv))); \
     if (!h) croak("Data::HyperLogLog::Shared object destroyed during the call")
 
@@ -183,6 +185,10 @@ merge(self, other)
         croak("Data::HyperLogLog::Shared->merge: expected a Data::HyperLogLog::Shared object");
     HllHandle *o = INT2PTR(HllHandle*, SvIV(SvRV(other)));
     if (!o) croak("Attempted to use a destroyed Data::HyperLogLog::Shared object");
+    /* sv_isobject/sv_derived_from above begin with SvGETMAGIC(other), so a
+     * tied `other` can have destroyed self before h is used below. `o` was
+     * read after that magic and needs no re-read. */
+    REEXTRACT(self);
 
     /* Snapshot the other's registers under its read lock into a temp
      * buffer, then release before taking self's write lock.  Copying to
