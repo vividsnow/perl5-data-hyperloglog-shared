@@ -94,7 +94,8 @@ struct HllHeader {
     uint32_t drain_seq;               /* 56  futex bumped by a reader releasing under a draining writer (wakes it) */
     uint32_t slotless_rdepth;         /* 60  readers holding with no reader-slot (documented residual) */
     uint64_t stat_ops;                /* 64 */
-    uint8_t  _pad[184];               /* 72..255 */
+    uint8_t  sealed;                  /* 72  0 = mutable, 1 = frozen (read-only; lock-free reads) */
+    uint8_t  _pad[183];               /* 73..255 */
 };
 typedef struct HllHeader HllHeader;
 
@@ -114,6 +115,7 @@ typedef struct HllHandle {
     uint32_t       cached_pid;    /* getpid() cached at last slot claim */
     uint32_t       cached_fork_gen; /* hll_fork_gen value at last slot claim */
     uint32_t       slotless_held; /* read-locks this process holds with no reader-slot */
+    int            readonly;      /* 1 = frozen O_RDONLY/PROT_READ view: lock-free reads, mutation croaks */
 } HllHandle;
 
 /* ================================================================
@@ -648,6 +650,10 @@ static HllHandle *hll_create(const char *path, uint32_t precision, mode_t mode, 
             if (!hll_validate_header((HllHeader *)base, (uint64_t)st.st_size)) {
                 HLL_ERR("invalid HyperLogLog file"); munmap(base, map_size); flock(fd, LOCK_UN); close(fd); return NULL;
             }
+            if (((HllHeader *)base)->sealed) {
+                HLL_ERR("%s is frozen (read-only); open it with new_readonly", path);
+                munmap(base, map_size); flock(fd, LOCK_UN); close(fd); return NULL;
+            }
             flock(fd, LOCK_UN); close(fd);
             return hll_setup(base, map_size, path, -1);
         }
@@ -685,6 +691,10 @@ static HllHandle *hll_open_fd(int fd, char *errbuf) {
     if (!hll_validate_header((HllHeader *)base, (uint64_t)st.st_size)) {
         HLL_ERR("invalid HyperLogLog table"); munmap(base, ms); return NULL;
     }
+    if (((HllHeader *)base)->sealed) {
+        HLL_ERR("this HyperLogLog estimator is frozen (read-only); open it with new_readonly");
+        munmap(base, ms); return NULL;
+    }
     int myfd = fcntl(fd, F_DUPFD_CLOEXEC, 0);
     if (myfd < 0) { HLL_ERR("fcntl: %s", strerror(errno)); munmap(base, ms); return NULL; }
     return hll_setup(base, ms, NULL, myfd);
@@ -715,6 +725,48 @@ static void hll_destroy(HllHandle *h) {
 static inline int hll_msync(HllHandle *h) {
     if (!h || !h->base) return 0;
     return msync(h->base, h->mmap_size, MS_SYNC);
+}
+
+/* Open a FROZEN (sealed) file read-only: O_RDONLY + PROT_READ, no lock ever.
+ * The register array + geometry are immutable in a sealed file, so count/stats
+ * read directly with no reader-slot / rwlock traffic -- the mapping is never
+ * written, so it works from a read-only fd / read-only filesystem and can be
+ * shared PROT_READ across processes (same architecture; the native magic
+ * rejects a wrong-endian file at validation). */
+static HllHandle *hll_open_readonly(const char *path, char *errbuf) {
+    if (errbuf) errbuf[0] = '\0';
+    int fd = open(path, O_RDONLY|O_NOFOLLOW|O_CLOEXEC);
+    if (fd < 0) { HLL_ERR("open %s: %s", path, strerror(errno)); return NULL; }
+    struct stat st;
+    if (fstat(fd, &st) < 0) { HLL_ERR("fstat %s: %s", path, strerror(errno)); close(fd); return NULL; }
+    if ((uint64_t)st.st_size < sizeof(HllHeader)) { HLL_ERR("%s: file too small", path); close(fd); return NULL; }
+    size_t ms = (size_t)st.st_size;
+    void *base = mmap(NULL, ms, PROT_READ, MAP_SHARED, fd, 0);
+    close(fd);   /* the mapping keeps the file; a read-only view needs no fd (no msync/ftruncate) */
+    if (base == MAP_FAILED) { HLL_ERR("mmap %s: %s", path, strerror(errno)); return NULL; }
+    if (!hll_validate_header((HllHeader *)base, (uint64_t)st.st_size)) {
+        HLL_ERR("%s: invalid HyperLogLog file", path); munmap(base, ms); return NULL;
+    }
+    if (!((HllHeader *)base)->sealed) {
+        HLL_ERR("%s is not frozen: call ->freeze on the producer before opening read-only", path);
+        munmap(base, ms); return NULL;
+    }
+    HllHandle *h = hll_setup(base, ms, path, -1);   /* munmaps on OOM */
+    if (!h) { HLL_ERR("out of memory"); return NULL; }
+    h->readonly = 1;
+    return h;
+}
+
+/* Seal an estimator: make it permanently immutable so it can be shipped and
+ * opened read-only.  Takes the write lock so no add is in flight, publishes
+ * the seal, then flushes it (file/memfd-backed).  Afterwards every mutator
+ * croaks and a read-write reopen is refused. */
+static int hll_freeze(HllHandle *h) {
+    hll_rwlock_wrlock(h);
+    h->hdr->sealed = 1;
+    hll_rwlock_wrunlock(h);
+    if (h->path || h->backing_fd >= 0) return hll_msync(h);  /* durability for file/memfd-backed */
+    return 0;   /* anonymous: the seal lives in shared memory (visible to forks); nothing to flush */
 }
 
 /* ================================================================

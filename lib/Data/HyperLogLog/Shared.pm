@@ -40,6 +40,11 @@ Data::HyperLogLog::Shared - shared-memory HyperLogLog cardinality estimator for 
     # share across processes via a backing file
     my $shared = Data::HyperLogLog::Shared->new("/tmp/visitors.hll", 14);
 
+    # freeze and ship: query it read-only (lock-free) on other machines
+    $shared->freeze;
+    my $ro = Data::HyperLogLog::Shared->new_readonly("/tmp/visitors.hll");
+    $ro->count;
+
 =head1 DESCRIPTION
 
 A HyperLogLog estimator in shared memory: it counts the number of B<distinct>
@@ -76,6 +81,7 @@ B<Linux-only>. Requires 64-bit Perl.
     my $hll = Data::HyperLogLog::Shared->new(undef, 16);            # anonymous, precision 16
     my $hll = Data::HyperLogLog::Shared->new_memfd($name, $precision);
     my $hll = Data::HyperLogLog::Shared->new_from_fd($fd);
+    my $ro  = Data::HyperLogLog::Shared->new_readonly($path);       # frozen file, read-only
 
 C<$path> is the backing file (C<undef> or omitted for an anonymous mapping).
 C<$precision> is optional and defaults to B<14>; it must be between B<4> and
@@ -85,6 +91,8 @@ about C<1.04 / sqrt(m)> (precision 14 -> ~0.81%, 16 -> ~0.41%, 12 -> ~1.63%).
 When reopening an existing file or memfd, the stored precision wins and the
 caller's argument is ignored. C<new_memfd> creates a Linux memfd (transferable
 via its C<memfd> descriptor); C<new_from_fd> reopens one in another process.
+C<new_readonly> opens a B<frozen> file read-only for lock-free querying (see
+L</"FROZEN (READ-ONLY) MODE">).
 
 =head2 Adding and counting
 
@@ -130,8 +138,10 @@ estimators.
 
 C<stats()> returns a hashref: C<precision>, C<registers> (the register count
 C<m>), C<count> (the current rounded estimate), C<ops> (running count of
-mutating operations -- C<add>, C<add_many>, C<merge>, C<clear>), and
-C<mmap_size> (bytes of the shared mapping).
+mutating operations -- C<add>, C<add_many>, C<merge>, C<clear>), C<mmap_size>
+(bytes of the shared mapping), C<frozen> (1 if the estimator has been sealed by
+C<freeze>, else 0), and C<readonly> (1 if this handle is a read-only view, from
+C<new_readonly> or the handle that called C<freeze>, else 0).
 
 =head1 ACCURACY
 
@@ -160,6 +170,43 @@ of what all of them have seen.
     unless (fork) { $hll->add_many([ map { "ev-$_" } 1 .. 1000 ]); exit }
     wait;
     print $hll->count, "\n";   # ~1000, counting the child's additions
+
+=head1 FROZEN (READ-ONLY) MODE
+
+A file-backed estimator can be B<frozen> and then shipped to other machines,
+where consumers open it B<read-only> and query it with B<no locking at all>.
+
+    # producer: build, freeze, ship the file
+    my $hll = Data::HyperLogLog::Shared->new("/tmp/visitors.hll", 14);
+    $hll->add_many(\@known);
+    $hll->freeze;                 # seal: now immutable, and $hll itself is read-only
+    # ... copy /tmp/visitors.hll to another host ...
+
+    # consumer (any process, same architecture): read-only, lock-free
+    my $ro = Data::HyperLogLog::Shared->new_readonly("/tmp/visitors.hll");
+    $ro->count;
+
+C<freeze> takes the write lock, marks the estimator B<permanently immutable>
+(there is no unfreeze -- rebuild the file to change it), and flushes the seal
+to disk. A frozen estimator rejects every mutator (C<add>, C<add_many>,
+C<merge>, C<clear>) with a croak, and a read-write reopen
+(C<< new($path, ...) >>) of a sealed file is B<refused> -- so a shipped
+artifact can never be silently mutated out from under its readers.
+
+C<new_readonly($path)> maps the file C<O_RDONLY> / C<PROT_READ> and B<requires
+it to be frozen> (it croaks on a file that was never C<freeze>d). Because a
+sealed estimator's registers and geometry are immutable, C<count> and C<stats>
+read them B<directly, taking no reader lock> -- the mapping is never written,
+so a read-only view works from a read-only file descriptor or a read-only
+filesystem, and any number of processes can share one C<PROT_READ> mapping.
+C<frozen> and C<readonly> report the two states.
+
+B<Portability.> The on-disk format is native binary (native-endian 64-bit
+words), so a frozen file may be copied only between machines of the B<same
+architecture>; a wrong-endian file is rejected at open by the magic check.
+B<Copy the file to each consumer> -- do not share one file over a network
+filesystem: the lock is a Linux futex (process-local to one kernel), and the
+"no live writer" contract assumes a static copy. Linux-only; 64-bit Perl.
 
 =head1 SECURITY
 

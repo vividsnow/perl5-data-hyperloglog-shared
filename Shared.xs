@@ -90,6 +90,24 @@ new_from_fd(class, fd)
   OUTPUT:
     RETVAL
 
+SV *
+new_readonly(class, path)
+    const char *class
+    SV *path
+  PREINIT:
+    char errbuf[HLL_ERR_BUFLEN];
+  CODE:
+    /* Open a FROZEN (sealed) file read-only: O_RDONLY + PROT_READ, lock-free.
+       Requires ->freeze on the producer; a non-frozen file is refused. */
+    const char *p = (SvGETMAGIC(path), SvOK(path)) ? SvPV_nolen(path) : NULL;
+    if (!p) croak("Data::HyperLogLog::Shared->new_readonly: path is required");
+    HllHandle *h = hll_open_readonly(p, errbuf);
+    if (!h) croak("Data::HyperLogLog::Shared->new_readonly: %s", errbuf);
+    class = SvPV_nolen(ST(0));   /* re-read: the SvGETMAGIC above can run arbitrary Perl that reallocs/frees ST(0)'s PV before we bless */
+    MAKE_OBJ(class, h);
+  OUTPUT:
+    RETVAL
+
 void
 DESTROY(self)
     SV *self
@@ -108,9 +126,11 @@ add(self, item)
     STRLEN n;
     const char *s;
   CODE:
+    if (h->readonly) croak("Data::HyperLogLog::Shared->add: estimator is frozen (read-only)");
     s = SvPVbyte(item, n);
     REEXTRACT(self);
     hll_rwlock_wrlock(h);
+    if (h->hdr->sealed) { hll_rwlock_wrunlock(h); croak("Data::HyperLogLog::Shared->add: estimator is frozen (read-only)"); }
     RETVAL = hll_add_locked(h, s, n);
     __atomic_fetch_add(&h->hdr->stat_ops, 1, __ATOMIC_RELAXED);
     hll_rwlock_wrunlock(h);
@@ -127,6 +147,7 @@ add_many(self, items)
     IV  top;
     UV  added = 0;
   CODE:
+    if (h->readonly) croak("Data::HyperLogLog::Shared->add_many: estimator is frozen (read-only)");
     SvGETMAGIC(items);
     if (!SvROK(items) || SvTYPE(SvRV(items)) != SVt_PVAV)
         croak("Data::HyperLogLog::Shared->add_many: expected an array reference");
@@ -154,6 +175,7 @@ add_many(self, items)
         }
         REEXTRACT(self);
         hll_rwlock_wrlock(h);                            /* locked region: NO croak-capable calls */
+        if (h->hdr->sealed) { hll_rwlock_wrunlock(h); croak("Data::HyperLogLog::Shared->add_many: estimator is frozen (read-only)"); }
         for (i = 0; i < cnt; i++) added += (UV)hll_add_locked(h, ps[i], ls[i]);
         __atomic_fetch_add(&h->hdr->stat_ops, 1, __ATOMIC_RELAXED);  /* a call always counts, even an empty batch */
         hll_rwlock_wrunlock(h);
@@ -169,9 +191,13 @@ count(self)
     EXTRACT(self);
     double E;
   CODE:
-    hll_rwlock_rdlock(h);
-    E = hll_count_locked(h);
-    hll_rwlock_rdunlock(h);
+    if (h->readonly) {                     /* frozen: immutable registers, no lock */
+        E = hll_count_locked(h);
+    } else {
+        hll_rwlock_rdlock(h);
+        E = hll_count_locked(h);
+        hll_rwlock_rdunlock(h);
+    }
     RETVAL = (UV)(E + 0.5);
   OUTPUT:
     RETVAL
@@ -183,6 +209,7 @@ merge(self, other)
   PREINIT:
     EXTRACT(self);
   CODE:
+    if (h->readonly) croak("Data::HyperLogLog::Shared->merge: estimator is frozen (read-only)");
     if (!sv_isobject(other) || !sv_derived_from(other, "Data::HyperLogLog::Shared"))
         croak("Data::HyperLogLog::Shared->merge: expected a Data::HyperLogLog::Shared object");
     HllHandle *o = INT2PTR(HllHandle*, SvIV(SvRV(other)));
@@ -208,8 +235,7 @@ merge(self, other)
     Newxz(tmp, (size_t)dm, uint8_t);       /* dm bounded to 2^HLL_MAX_PRECISION by the check above */
     SAVEFREEPV(tmp);                       /* freed on normal return OR croak unwind */
     uint32_t copied = 0;
-    hll_rwlock_rdlock(o);
-    {
+    if (o->readonly) {                     /* frozen other: immutable registers, no lock */
         uint32_t sm = 0;
         uint8_t *src = hll_regs_checked(o, &sm, NULL);  /* bound the memcpy against o's mapping */
         if (src) {
@@ -217,10 +243,22 @@ merge(self, other)
             memcpy(tmp, src, (size_t)n);
             copied = n;
         }
+    } else {
+        hll_rwlock_rdlock(o);
+        {
+            uint32_t sm = 0;
+            uint8_t *src = hll_regs_checked(o, &sm, NULL);  /* bound the memcpy against o's mapping */
+            if (src) {
+                uint32_t n = (sm < dm) ? sm : dm;           /* never overflow tmp (dm bytes) */
+                memcpy(tmp, src, (size_t)n);
+                copied = n;
+            }
+        }
+        hll_rwlock_rdunlock(o);
     }
-    hll_rwlock_rdunlock(o);
 
     hll_rwlock_wrlock(h);
+    if (h->hdr->sealed) { hll_rwlock_wrunlock(h); croak("Data::HyperLogLog::Shared->merge: estimator is frozen (read-only)"); }
     hll_merge_regs(h, tmp, copied);
     __atomic_fetch_add(&h->hdr->stat_ops, 1, __ATOMIC_RELAXED);
     hll_rwlock_wrunlock(h);
@@ -231,10 +269,42 @@ clear(self)
   PREINIT:
     EXTRACT(self);
   CODE:
+    if (h->readonly) croak("Data::HyperLogLog::Shared->clear: estimator is frozen (read-only)");
     hll_rwlock_wrlock(h);
+    if (h->hdr->sealed) { hll_rwlock_wrunlock(h); croak("Data::HyperLogLog::Shared->clear: estimator is frozen (read-only)"); }
     hll_clear_locked(h);
     __atomic_fetch_add(&h->hdr->stat_ops, 1, __ATOMIC_RELAXED);
     hll_rwlock_wrunlock(h);
+
+void
+freeze(self)
+    SV *self
+  PREINIT:
+    EXTRACT(self);
+  CODE:
+    if (h->readonly) croak("Data::HyperLogLog::Shared->freeze: cannot freeze a read-only handle");
+    if (hll_freeze(h) != 0) croak("Data::HyperLogLog::Shared->freeze: msync: %s", strerror(errno));
+    h->readonly = 1;   /* this handle now rejects mutation too (the file is sealed) */
+
+UV
+frozen(self)
+    SV *self
+  PREINIT:
+    EXTRACT(self);
+  CODE:
+    RETVAL = h->hdr->sealed ? 1 : 0;
+  OUTPUT:
+    RETVAL
+
+UV
+readonly(self)
+    SV *self
+  PREINIT:
+    EXTRACT(self);
+  CODE:
+    RETVAL = h->readonly ? 1 : 0;
+  OUTPUT:
+    RETVAL
 
 UV
 precision(self)
@@ -268,12 +338,12 @@ stats(self)
         uint32_t precision, m;
         /* Snapshot under the lock; do all (croak-capable) Perl allocation after
            releasing it -- so an OOM in newHV/newSVuv can never strand the lock. */
-        hll_rwlock_rdlock(h);
+        if (!h->readonly) hll_rwlock_rdlock(h);   /* frozen: immutable, no lock */
         E         = hll_count_locked(h);
         ops       = h->hdr->stat_ops;
         precision = h->hdr->precision;
         m         = h->hdr->m;
-        hll_rwlock_rdunlock(h);
+        if (!h->readonly) hll_rwlock_rdunlock(h);
 
         HV *hv = newHV();
         hv_stores(hv, "precision",  newSVuv(precision));
@@ -281,6 +351,8 @@ stats(self)
         hv_stores(hv, "count",      newSVuv((UV)(E + 0.5)));
         hv_stores(hv, "ops",        newSVuv(ops));
         hv_stores(hv, "mmap_size",  newSVuv((UV)h->mmap_size));
+        hv_stores(hv, "frozen",     newSVuv(h->hdr->sealed ? 1 : 0));
+        hv_stores(hv, "readonly",   newSVuv(h->readonly ? 1 : 0));
         RETVAL = newRV_noinc((SV *)hv);
     }
   OUTPUT:
@@ -312,7 +384,7 @@ sync(self)
   PREINIT:
     EXTRACT(self);
   CODE:
-    if (hll_msync(h) != 0) croak("sync: %s", strerror(errno));
+    if (!h->readonly && hll_msync(h) != 0) croak("sync: %s", strerror(errno));
 
 void
 unlink(self, ...)
