@@ -54,7 +54,7 @@ new(class, path = &PL_sv_undef, precision = 14, ...)
        arbitrary Perl code that reallocs/frees path's PV, dangling p */
     const char *p = (SvGETMAGIC(path), SvOK(path)) ? SvPV_nolen(path) : NULL;
     HllHandle *h = hll_create(p, (uint32_t)precision, mode, errbuf);
-    if (!h) croak("Data::HyperLogLog::Shared->new: %s", errbuf);
+    if (!h) croak("Data::HyperLogLog::Shared->new: %s", errbuf[0] ? errbuf : "out of memory");
     MAKE_OBJ(class, h);
   OUTPUT:
     RETVAL
@@ -72,7 +72,7 @@ new_memfd(class, name = &PL_sv_undef, precision = 14)
         croak("Data::HyperLogLog::Shared->new_memfd: precision must be between %d and %d",
               HLL_MIN_PRECISION, HLL_MAX_PRECISION);
     HllHandle *h = hll_create_memfd(nm, (uint32_t)precision, errbuf);
-    if (!h) croak("Data::HyperLogLog::Shared->new_memfd: %s", errbuf);
+    if (!h) croak("Data::HyperLogLog::Shared->new_memfd: %s", errbuf[0] ? errbuf : "out of memory");
     MAKE_OBJ(class, h);
   OUTPUT:
     RETVAL
@@ -85,7 +85,7 @@ new_from_fd(class, fd)
     char errbuf[HLL_ERR_BUFLEN];
   CODE:
     HllHandle *h = hll_open_fd(fd, errbuf);
-    if (!h) croak("Data::HyperLogLog::Shared->new_from_fd: %s", errbuf);
+    if (!h) croak("Data::HyperLogLog::Shared->new_from_fd: %s", errbuf[0] ? errbuf : "out of memory");
     MAKE_OBJ(class, h);
   OUTPUT:
     RETVAL

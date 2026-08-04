@@ -515,13 +515,17 @@ static inline void hll_init_header(void *base, uint32_t precision, uint32_t m, u
     /* Explicitly zero the header + reader-slot region (lock-recovery state, like
        intern.h); the register array relies on the fresh mapping being OS zero-filled. */
     memset(base, 0, (size_t)L.regs);
-    hdr->magic            = HLL_MAGIC;
     hdr->version          = HLL_VERSION;
     hdr->precision        = precision;
     hdr->m                = m;
     hdr->total_size       = total;
     hdr->reader_slots_off = L.reader_slots;
     hdr->regs_off         = L.regs;
+    /* Publish magic LAST, as a release store: it is the commit point, so a
+       creator killed before this store leaves magic==0 -- which the
+       crashed-creator recovery treats as an abandoned mid-init file and
+       recovers, instead of a magic-set-but-incomplete header that would brick. */
+    __atomic_store_n(&hdr->magic, HLL_MAGIC, __ATOMIC_RELEASE);
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
 }
 
@@ -611,6 +615,16 @@ static int hll_secure_open(const char *path, mode_t mode, char *errbuf) {
     return -1;
 }
 
+/* True iff the whole mapped region is zero. A freshly ftruncate'd file (the only
+   thing an abandoned mid-init creator leaves) reads as all zeros, so this lets the
+   recovery re-init ONLY a provably-empty file and never a same-owner file that
+   merely starts with a zero word. Recovery is a cold path, so a byte scan is fine. */
+static inline int hll_region_is_zero(const void *p, size_t n) {
+    const unsigned char *b = (const unsigned char *)p;
+    for (size_t i = 0; i < n; i++) if (b[i]) return 0;
+    return 1;
+}
+
 static HllHandle *hll_create(const char *path, uint32_t precision, mode_t mode, char *errbuf) {
     uint32_t m;
     if (!hll_validate_create_args(precision, &m, errbuf)) return NULL;
@@ -652,10 +666,11 @@ static HllHandle *hll_create(const char *path, uint32_t precision, mode_t mode, 
                  * ftruncate and hll_init_header below leaves a full-size, all-zero
                  * (magic==0) file that would otherwise brick every future open of
                  * this path.  Re-initialize it, but ONLY when it is exactly our
-                 * size, still uninitialized (magic==0), and owned by us -- a valid
-                 * or foreign file fails this and still errors, never clobbered. */
+                 * size, owned by us, and provably all-zero (a fresh ftruncate) --
+                 * a valid, foreign, wrong-size, or any non-empty file fails this
+                 * and still errors, never clobbered. */
                 if (((HllHeader *)base)->magic == 0 && (uint64_t)st.st_size == total
-                    && st.st_uid == geteuid()) {
+                    && st.st_uid == geteuid() && hll_region_is_zero(base, map_size)) {
                     if (fchmod(fd, mode) < 0) {
                         HLL_ERR("%s: fchmod: %s", path, strerror(errno));
                         munmap(base, map_size); flock(fd, LOCK_UN); close(fd); return NULL;
