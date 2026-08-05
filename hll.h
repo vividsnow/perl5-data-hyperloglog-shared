@@ -675,7 +675,6 @@ static HllHandle *hll_create(const char *path, uint32_t precision, mode_t mode, 
                         HLL_ERR("%s: fchmod: %s", path, strerror(errno));
                         munmap(base, map_size); flock(fd, LOCK_UN); close(fd); return NULL;
                     }
-                    memset(base, 0, map_size);   /* start from a provably empty estimator */
                     hll_init_header(base, precision, m, total);
                     flock(fd, LOCK_UN); close(fd);
                     return hll_setup(base, map_size, path, -1);
