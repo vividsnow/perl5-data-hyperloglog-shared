@@ -522,9 +522,10 @@ static inline void hll_init_header(void *base, uint32_t precision, uint32_t m, u
     hdr->reader_slots_off = L.reader_slots;
     hdr->regs_off         = L.regs;
     /* Publish magic LAST, as a release store: it is the commit point, so a
-       creator killed before this store leaves magic==0 -- which the
-       crashed-creator recovery treats as an abandoned mid-init file and
-       recovers, instead of a magic-set-but-incomplete header that would brick. */
+       creator killed before it leaves magic==0 and the file is never mistaken
+       for a valid one.  Recovery re-initializes such a file only while it is
+       still all-zero (a kill during the ftruncate or the zeroing above); a kill
+       during the few field stores leaves a file to remove by hand. */
     __atomic_store_n(&hdr->magic, HLL_MAGIC, __ATOMIC_RELEASE);
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
 }
@@ -678,6 +679,11 @@ static HllHandle *hll_create(const char *path, uint32_t precision, mode_t mode, 
                     hll_init_header(base, precision, m, total);
                     flock(fd, LOCK_UN); close(fd);
                     return hll_setup(base, map_size, path, -1);
+                }
+                if (((HllHeader *)base)->magic == 0 && (uint64_t)st.st_size == total
+                    && st.st_uid == geteuid()) {
+                    HLL_ERR("%s: incomplete HyperLogLog file left by an interrupted create; remove it and retry", path);
+                    munmap(base, map_size); flock(fd, LOCK_UN); close(fd); return NULL;
                 }
                 HLL_ERR("invalid HyperLogLog file"); munmap(base, map_size); flock(fd, LOCK_UN); close(fd); return NULL;
             }
